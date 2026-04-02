@@ -42,6 +42,12 @@ python skychat_mcp.py --http --port=9000
 
 # self-hosted instance
 SKYCHAT_URL=wss://chat.example.com/api/ws python skychat_mcp.py --http
+
+# auto-reply bot: LLM responds when @mentioned
+python skychat_mcp.py --http --auto-reply
+python skychat_mcp.py --http --auto-reply --llm-url=http://localhost:8080
+python skychat_mcp.py --http --auto-reply --system-prompt="You are a pirate."
+python skychat_mcp.py --http --auto-reply --system-prompt-file=prompt.txt
 ```
 
 ### connecting llama.cpp web UI
@@ -94,6 +100,29 @@ To log out: call the `logout` tool, or delete `~/.config/skychat-mcp/token.json`
 > "What are people talking about in the chat right now? Summarise it."
 
 > "Reply to message 12345 saying thanks for the info."
+
+---
+
+## auto-reply bot
+
+Pass `--auto-reply` to have the server respond automatically whenever the bot account is @mentioned. It runs a small agentic loop: the LLM receives the mention, can call tools (`reply_to`, `send_message`, `join_room`, `read_messages`) until it's satisfied, then stops.
+
+```bash
+python skychat_mcp.py --http --auto-reply
+```
+
+Options:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--auto-reply` | off | Enable the mention→LLM loop |
+| `--llm-url=URL` | `http://localhost:8080` | Base URL of the OpenAI-compatible API (`/v1/chat/completions`) |
+| `--system-prompt=TEXT` | a brief helpful-assistant prompt | System prompt sent to the LLM |
+| `--system-prompt-file=PATH` | — | Read system prompt from a file instead |
+
+The LLM must support OpenAI-style function/tool calling. llama.cpp (`llama-server`) works out of the box if the model has tool-call support.
+
+Only one mention is processed at a time — if another arrives while the agent is running it is skipped to avoid flooding the chat.
 
 ---
 
