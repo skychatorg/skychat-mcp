@@ -29,6 +29,8 @@ import os
 import re
 import sys
 import time
+import urllib.request
+import urllib.error
 from contextlib import asynccontextmanager
 from html import unescape
 from pathlib import Path
@@ -177,6 +179,9 @@ class SkyChat:
         self._username: str  = ""
         self._password: str  = ""
         self._guest:    bool = False
+
+        # Optional async callback(message_dict) called when bot is @mentioned
+        self.mention_callback: Optional[Any] = None
 
     # ── Public startup ────────────────────────────────────────────────
 
@@ -415,6 +420,17 @@ class SkyChat:
                     self._seen_ids.discard(removed["id"])
                 log.info("[room %s] <%s> %s",
                          e["room_id"], e["user"], e["content"][:100])
+                # Fire mention callback if someone @mentioned the bot
+                uname = self.username
+                if (
+                    self.mention_callback is not None
+                    and uname != "*Guest"
+                    and e["user"] != uname
+                    and re.search(r"@" + re.escape(uname), e["content"], re.IGNORECASE)
+                ):
+                    asyncio.create_task(
+                        self.mention_callback(e), name="auto-reply"
+                    )
 
         elif ev == "message-edit":
             if isinstance(data, dict):
@@ -508,6 +524,73 @@ class SkyChat:
 
 # ── Singleton ─────────────────────────────────────────────────────────────────
 _sc = SkyChat()
+
+
+# ── Auto-reply ────────────────────────────────────────────────────────────────
+
+_auto_reply_cfg: dict = {
+    "enabled":         False,
+    "system_prompt":   "You are a helpful, concise chat participant. Reply briefly.",
+    "llm_url":         "http://localhost:8080",
+    "context_limit":   20,   # recent messages to include as context
+}
+
+_auto_reply_lock = asyncio.Lock()
+
+
+async def _call_llm(messages: list) -> str:
+    """POST to the OpenAI-compatible /v1/chat/completions endpoint."""
+    payload = json.dumps({
+        "messages":   messages,
+        "max_tokens": 256,
+        "temperature": 0.7,
+    }).encode()
+    url = _auto_reply_cfg["llm_url"].rstrip("/") + "/v1/chat/completions"
+
+    def _request() -> dict:
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read())
+
+    result = await asyncio.to_thread(_request)
+    return result["choices"][0]["message"]["content"].strip()
+
+
+async def _auto_reply_to_mention(msg: dict) -> None:
+    """Generate and post an LLM reply when the bot is @mentioned."""
+    if _auto_reply_lock.locked():
+        log.info("Auto-reply: already busy, skipping mention from <%s>", msg["user"])
+        return
+    async with _auto_reply_lock:
+        room_id = msg["room_id"]
+        context = _sc.get_messages(room_id=room_id, limit=_auto_reply_cfg["context_limit"])
+        chat_log = "\n".join(f"<{m['user']}> {m['content']}" for m in context)
+
+        llm_messages = [
+            {"role": "system", "content": _auto_reply_cfg["system_prompt"]},
+            {
+                "role": "user",
+                "content": (
+                    f"Recent chat log:\n{chat_log}\n\n"
+                    f"<{msg['user']}> just mentioned you (@{_sc.username}). "
+                    "Write your reply (plain text only, no @mention prefix needed)."
+                ),
+            },
+        ]
+
+        log.info("Auto-reply: mention from <%s> in room %s — calling LLM",
+                 msg["user"], room_id)
+        try:
+            reply = await _call_llm(llm_messages)
+            if reply:
+                await _sc.post(f"@{msg['id']} {reply}", room_id=room_id)
+                log.info("Auto-reply sent: %s", reply[:120])
+        except Exception as exc:
+            log.warning("Auto-reply: LLM call failed: %s", exc)
 
 
 # ── MCP tools ─────────────────────────────────────────────────────────────────
@@ -632,12 +715,20 @@ if __name__ == "__main__":
     from starlette.middleware.cors import CORSMiddleware
 
     # ── Parse args ────────────────────────────────────────────────────
-    guest = "--guest" in sys.argv
-    http  = "--http"  in sys.argv
-    port  = 8765
+    guest       = "--guest"      in sys.argv
+    http        = "--http"       in sys.argv
+    auto_reply  = "--auto-reply" in sys.argv
+    port        = 8765
     for arg in sys.argv:
         if arg.startswith("--port="):
             port = int(arg.split("=", 1)[1])
+        elif arg.startswith("--llm-url="):
+            _auto_reply_cfg["llm_url"] = arg.split("=", 1)[1]
+        elif arg.startswith("--system-prompt="):
+            _auto_reply_cfg["system_prompt"] = arg.split("=", 1)[1]
+        elif arg.startswith("--system-prompt-file="):
+            path = Path(arg.split("=", 1)[1])
+            _auto_reply_cfg["system_prompt"] = path.read_text().strip()
 
     # ── Resolve credentials BEFORE uvicorn (stdin still available) ────
     # We don't connect here — just figure out what credentials to use.
@@ -727,6 +818,10 @@ if __name__ == "__main__":
             try:
                 await _sc.start(**_auth_kwargs)
                 log.info("WebSocket connected as: %s", _sc.username)
+                if auto_reply:
+                    _auto_reply_cfg["enabled"] = True
+                    _sc.mention_callback = _auto_reply_to_mention
+                    log.info("Auto-reply enabled (LLM: %s)", _auto_reply_cfg["llm_url"])
             except RuntimeError as exc:
                 if _auth_kwargs.get("token"):
                     log.warning("Token auth failed (%s) — retrying as guest", exc)
