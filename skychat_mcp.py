@@ -534,7 +534,7 @@ _auto_reply_cfg: dict = {
     "llm_url":       "http://localhost:8080",
 }
 
-_auto_reply_lock = asyncio.Lock()
+_auto_reply_queue: asyncio.Queue = asyncio.Queue(maxsize=2)
 
 # Tools exposed to the LLM agent (OpenAI function-calling schema).
 # Mirrors the MCP tool signatures so the LLM uses the same mental model.
@@ -691,28 +691,41 @@ async def _run_agent(llm_messages: list, max_rounds: int = 10) -> None:
 
 
 async def _auto_reply_to_mention(msg: dict) -> None:
-    """Triggered when the bot is @mentioned in a live message."""
-    if _auto_reply_lock.locked():
-        log.info("Auto-reply: already busy, skipping mention from <%s>", msg["user"])
-        return
-    async with _auto_reply_lock:
-        log.info("Auto-reply: mention from <%s> in room %s (msg id=%s)",
-                 msg["user"], msg["room_id"], msg["id"])
-        llm_messages = [
-            {"role": "system", "content": _auto_reply_cfg["system_prompt"]},
-            {
-                "role": "user",
-                "content": (
-                    f"You (@{_sc.username}) were mentioned by <{msg['user']}> "
-                    f"in room {msg['room_id']}.\n"
-                    f"Message ID: {msg['id']}\n"
-                    f"Their message: {msg['content']}\n\n"
-                    "Use your tools to join the correct room (if needed) and "
-                    "reply to that message ID."
-                ),
-            },
-        ]
-        await _run_agent(llm_messages)
+    """Triggered when the bot is @mentioned — enqueue for serial processing."""
+    try:
+        _auto_reply_queue.put_nowait(msg)
+        log.info("Auto-reply: queued mention from <%s> (queue size=%d)",
+                 msg["user"], _auto_reply_queue.qsize())
+    except asyncio.QueueFull:
+        log.info("Auto-reply: queue full (2), dropping mention from <%s>", msg["user"])
+
+
+async def _auto_reply_worker() -> None:
+    """Processes queued mentions one at a time."""
+    while True:
+        msg = await _auto_reply_queue.get()
+        try:
+            log.info("Auto-reply: processing mention from <%s> in room %s (msg id=%s)",
+                     msg["user"], msg["room_id"], msg["id"])
+            llm_messages = [
+                {"role": "system", "content": _auto_reply_cfg["system_prompt"]},
+                {
+                    "role": "user",
+                    "content": (
+                        f"You (@{_sc.username}) were mentioned by <{msg['user']}> "
+                        f"in room {msg['room_id']}.\n"
+                        f"Message ID: {msg['id']}\n"
+                        f"Their message: {msg['content']}\n\n"
+                        "Use your tools to join the correct room (if needed) and "
+                        "reply to that message ID."
+                    ),
+                },
+            ]
+            await _run_agent(llm_messages)
+        except Exception as exc:
+            log.warning("Auto-reply: worker error: %s", exc)
+        finally:
+            _auto_reply_queue.task_done()
 
 
 # ── MCP tools ─────────────────────────────────────────────────────────────────
@@ -943,6 +956,7 @@ if __name__ == "__main__":
                 if auto_reply:
                     _auto_reply_cfg["enabled"] = True
                     _sc.mention_callback = _auto_reply_to_mention
+                    asyncio.create_task(_auto_reply_worker(), name="auto-reply-worker")
                     log.info("Auto-reply enabled (LLM: %s)", _auto_reply_cfg["llm_url"])
             except RuntimeError as exc:
                 if _auth_kwargs.get("token"):
