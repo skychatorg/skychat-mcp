@@ -529,68 +529,190 @@ _sc = SkyChat()
 # ── Auto-reply ────────────────────────────────────────────────────────────────
 
 _auto_reply_cfg: dict = {
-    "enabled":         False,
-    "system_prompt":   "You are a helpful, concise chat participant. Reply briefly.",
-    "llm_url":         "http://localhost:8080",
-    "context_limit":   20,   # recent messages to include as context
+    "enabled":       False,
+    "system_prompt": "You are a helpful, concise chat participant. Reply briefly.",
+    "llm_url":       "http://localhost:8080",
 }
 
 _auto_reply_lock = asyncio.Lock()
 
+# Tools exposed to the LLM agent (OpenAI function-calling schema).
+# Mirrors the MCP tool signatures so the LLM uses the same mental model.
+_AGENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "reply_to",
+            "description": "Quote-reply to a specific message by its ID.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "integer", "description": "ID of the message to reply to."},
+                    "reply_text": {"type": "string",  "description": "Your reply text."},
+                    "room_id":    {"type": "integer",  "description": "Room containing the message (omit if already joined)."},
+                },
+                "required": ["message_id", "reply_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_message",
+            "description": "Send a plain message to a room.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text":    {"type": "string",  "description": "Message content."},
+                    "room_id": {"type": "integer", "description": "Target room ID (omit for current room)."},
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "join_room",
+            "description": "Switch to a different room.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "room_id": {"type": "integer", "description": "Room ID to join."},
+                },
+                "required": ["room_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_messages",
+            "description": "Return recent buffered messages from a room.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "room_id": {"type": "integer", "description": "Filter by room ID."},
+                    "limit":   {"type": "integer", "description": "Max messages to return (1–200, default 30)."},
+                },
+                "required": [],
+            },
+        },
+    },
+]
 
-async def _call_llm(messages: list) -> str:
-    """POST to the OpenAI-compatible /v1/chat/completions endpoint."""
-    payload = json.dumps({
-        "messages":   messages,
-        "max_tokens": 256,
-        "temperature": 0.7,
-    }).encode()
+
+async def _execute_agent_tool(name: str, args: dict) -> str:
+    """Execute a tool call made by the LLM agent."""
+    if name == "reply_to":
+        if not _sc.connected:
+            return "Error: not connected."
+        await _sc.post(f"@{args['message_id']} {args['reply_text']}",
+                       room_id=args.get("room_id"))
+        return f"Replied to message {args['message_id']}."
+    elif name == "send_message":
+        if not _sc.connected:
+            return "Error: not connected."
+        await _sc.post(args["text"], room_id=args.get("room_id"))
+        return f"Sent."
+    elif name == "join_room":
+        await _sc.join(args["room_id"])
+        return f"Joined room {args['room_id']}."
+    elif name == "read_messages":
+        msgs = _sc.get_messages(room_id=args.get("room_id"),
+                                limit=args.get("limit", 30))
+        if not msgs:
+            return "No messages buffered."
+        return "\n".join(f"[{m['ts']}] id={m['id']} <{m['user']}> {m['content']}"
+                         for m in msgs)
+    else:
+        return f"Unknown tool: {name}"
+
+
+async def _run_agent(llm_messages: list, max_rounds: int = 10) -> None:
+    """
+    Agentic loop: call the LLM, execute any tool calls it makes, feed
+    results back, repeat until the model stops calling tools or we hit
+    the round limit.
+    """
     url = _auto_reply_cfg["llm_url"].rstrip("/") + "/v1/chat/completions"
 
-    def _request() -> dict:
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.loads(resp.read())
+    for round_n in range(max_rounds):
+        payload = json.dumps({
+            "messages":    llm_messages,
+            "tools":       _AGENT_TOOLS,
+            "tool_choice": "auto",
+            "max_tokens":  512,
+            "temperature": 0.7,
+        }).encode()
 
-    result = await asyncio.to_thread(_request)
-    return result["choices"][0]["message"]["content"].strip()
+        def _request() -> dict:
+            req = urllib.request.Request(
+                url, data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read())
+
+        try:
+            result = await asyncio.to_thread(_request)
+        except Exception as exc:
+            log.warning("Auto-reply: LLM request failed (round %d): %s", round_n, exc)
+            return
+
+        choice  = result["choices"][0]
+        message = choice["message"]
+        llm_messages.append(message)
+
+        tool_calls = message.get("tool_calls") or []
+        if not tool_calls:
+            # Model finished — no more tool calls
+            log.info("Auto-reply: agent done after %d round(s)", round_n + 1)
+            return
+
+        # Execute each tool call and collect results
+        for tc in tool_calls:
+            fn   = tc["function"]
+            name = fn["name"]
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except Exception:
+                args = {}
+            log.info("Auto-reply: tool_call %s(%s)", name, args)
+            tool_result = await _execute_agent_tool(name, args)
+            log.info("Auto-reply: tool result: %s", tool_result[:120])
+            llm_messages.append({
+                "role":         "tool",
+                "tool_call_id": tc["id"],
+                "content":      tool_result,
+            })
+
+    log.warning("Auto-reply: hit max_rounds (%d), stopping", max_rounds)
 
 
 async def _auto_reply_to_mention(msg: dict) -> None:
-    """Generate and post an LLM reply when the bot is @mentioned."""
+    """Triggered when the bot is @mentioned in a live message."""
     if _auto_reply_lock.locked():
         log.info("Auto-reply: already busy, skipping mention from <%s>", msg["user"])
         return
     async with _auto_reply_lock:
-        room_id = msg["room_id"]
-        context = _sc.get_messages(room_id=room_id, limit=_auto_reply_cfg["context_limit"])
-        chat_log = "\n".join(f"<{m['user']}> {m['content']}" for m in context)
-
+        log.info("Auto-reply: mention from <%s> in room %s (msg id=%s)",
+                 msg["user"], msg["room_id"], msg["id"])
         llm_messages = [
             {"role": "system", "content": _auto_reply_cfg["system_prompt"]},
             {
                 "role": "user",
                 "content": (
-                    f"Recent chat log:\n{chat_log}\n\n"
-                    f"<{msg['user']}> just mentioned you (@{_sc.username}). "
-                    "Write your reply (plain text only, no @mention prefix needed)."
+                    f"You (@{_sc.username}) were mentioned by <{msg['user']}> "
+                    f"in room {msg['room_id']}.\n"
+                    f"Message ID: {msg['id']}\n"
+                    f"Their message: {msg['content']}\n\n"
+                    "Use your tools to join the correct room (if needed) and "
+                    "reply to that message ID."
                 ),
             },
         ]
-
-        log.info("Auto-reply: mention from <%s> in room %s — calling LLM",
-                 msg["user"], room_id)
-        try:
-            reply = await _call_llm(llm_messages)
-            if reply:
-                await _sc.post(f"@{msg['id']} {reply}", room_id=room_id)
-                log.info("Auto-reply sent: %s", reply[:120])
-        except Exception as exc:
-            log.warning("Auto-reply: LLM call failed: %s", exc)
+        await _run_agent(llm_messages)
 
 
 # ── MCP tools ─────────────────────────────────────────────────────────────────
