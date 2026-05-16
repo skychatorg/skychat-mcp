@@ -1,0 +1,55 @@
+{
+    "name": "skychat-mcp",
+    "version": "0.1.0",
+    "description": "MCP server that connects skych.at chat to any MCP client (Claude Code, llama.cpp, etc.)",
+    "type": "module",
+    "main": "./build/index.js",
+    "types": "./build/index.d.ts",
+    "bin": {
+        "skychat-mcp": "./build/index.js"
+    },
+    "files": [
+        "build"
+    ],
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/skychatorg/skychat-mcp.git"
+    },
+    "homepage": "https://github.com/skychatorg/skychat-mcp",
+    "bugs": {
+        "url": "https://github.com/skychatorg/skychat-mcp/issues"
+    },
+    "keywords": [
+        "mcp",
+        "skychat",
+        "model-context-protocol",
+        "claude-code",
+        "llm"
+    ],
+    "author": "7PH <b.raymond@protonmail.com>",
+    "license": "WTFPL",
+    "engines": {
+        "node": ">=18"
+    },
+    "scripts": {
+        "build": "rm -rf build && tsc",
+        "start": "node build/index.js",
+        "dev": "tsx watch src/index.ts",
+        "lint": "eslint src --ext .ts",
+        "lint-fix": "eslint --fix src --ext .ts",
+        "prepublishOnly": "npm run build"
+    },
+    "dependencies": {
+        "@modelcontextprotocol/sdk": "^1.29.0",
+        "skychat": "^2.1.0",
+        "zod": "^3.23.8"
+    },
+    "devDependencies": {
+        "@types/node": "^20.14.0",
+        "@typescript-eslint/eslint-plugin": "^7.0.0",
+        "@typescript-eslint/parser": "^7.0.0",
+        "eslint": "^8.57.0",
+        "tsx": "^4.7.0",
+        "typescript": "^5.4.0"
+    }
+}
