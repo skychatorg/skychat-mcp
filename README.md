@@ -1,103 +1,74 @@
 # skychat-mcp
 
-A lightweight MCP server that exposes [skych.at](https://skych.at) chat to any MCP client (Claude Code, llama.cpp web UI, etc.).
+An MCP server that connects [skych.at](https://skych.at) chat to any MCP client (Claude Code, llama.cpp web UI, etc.).
 
-The WebSocket connection runs permanently in the background, buffering live messages as they arrive. The LLM reads from and writes to that buffer — no polling, no blocking on network calls.
+The WebSocket stays open in the background, buffering live messages as they arrive. The LLM reads from and writes to that buffer — no polling.
 
----
-
-## requirements
-
-- Python 3.10+
-- `pip install websockets mcp uvicorn`
-
----
-
-## install
-
-```bash
-git clone https://github.com/skychatorg/skychat-mcp.git
-cd skychat-mcp
-pip install websockets mcp uvicorn
-```
-
----
-
-## run the server
-
-```bash
-# streamable-http (default for Claude Code and llama.cpp web UI)
-python skychat_mcp.py --http
-
-# SSE transport
-python skychat_mcp.py --sse
-
-# guest session, no login prompt (read-only, limited history)
-python skychat_mcp.py --http --guest
-
-# custom port
-python skychat_mcp.py --http --port=9000
-
-# self-hosted skychat instance
-SKYCHAT_URL=wss://chat.example.com/api/ws python skychat_mcp.py --http
-```
-
-On first run you'll be prompted for username/password (or press Enter for guest). The token is saved to `~/.config/skychat-mcp/token.json` and reused next time.
+Built on top of the official [`skychat`](https://www.npmjs.com/package/skychat) npm package and the [Model Context Protocol TypeScript SDK](https://www.npmjs.com/package/@modelcontextprotocol/sdk).
 
 ---
 
 ## use with Claude Code
 
-Start the MCP server in a terminal first — the login prompt only appears here, not inside Claude Code:
+**1. Register the server** (one-time, from any directory where you launch `claude`):
 
 ```bash
-python skychat_mcp.py --http
+claude mcp add skychat -- npx -y skychat-mcp@latest --guest
 ```
 
-Then, from the project where you want to use skychat (any directory you'd normally launch `claude` from), register the server:
-
-```bash
-claude mcp add --transport http skychat http://localhost:8765/mcp
-```
-
-`claude mcp add` defaults to `local` scope (private to you, scoped to this project). Add `-s user` to make it visible from any project, or `-s project` to commit a shared `.mcp.json` for your team. Verify the connection:
+Add `-s user` to make it available in every project. Confirm with:
 
 ```bash
 $ claude mcp list
-skychat: http://localhost:8765/mcp (HTTP) - ✓ Connected
+skychat: npx -y skychat-mcp@latest --guest - ✓ Connected
 ```
 
-Inside a Claude Code session, the tools (`read_messages`, `send_message`, `reply_to`, …) appear automatically. Try:
+**2. Use it.** Start a Claude Code session — there is no separate process to run, Claude Code spawns the server itself. The tools (`read_messages`, `send_message`, `reply_to`, …) appear automatically. Talk to Claude in plain English:
 
-> "Read the last 20 messages from skychat and tell me what people are discussing."
+> "What are people saying in skychat right now?"
 >
-> "Send 'Hi from Claude Code' to room 0."
+> "Send 'hello from Claude Code' to the general room."
+>
+> "Reply to message 12345 with a thumbs up."
+>
+> "Switch to the IT room and summarise the last 30 messages."
 
-To remove the server: `claude mcp remove skychat`.
+**3. Log in with an account** (optional — guest works but has limited history):
+
+```bash
+claude mcp add \
+    -e SKYCHAT_USERNAME=alice \
+    -e SKYCHAT_PASSWORD=hunter2 \
+    skychat -- npx -y skychat-mcp@latest
+```
+
+The first successful login saves a token to `~/.config/skychat-mcp/token.json` (chmod 0600), so you can drop the env vars after that.
 
 ---
 
 ## use with llama.cpp web UI
 
-1. Start the MCP server: `python skychat_mcp.py --http`
-2. Open `http://localhost:8080` (your `llama-server`)
-3. **Settings → MCP** → add server URL `http://localhost:8765/mcp`
-4. Save — tools appear automatically.
+llama.cpp can't spawn a subprocess, so this one needs the HTTP transport, which you do run as a long-lived process:
+
+```bash
+npx -y skychat-mcp@latest --http --guest
+```
+
+In `llama-server` → **Settings → MCP** → add `http://localhost:8765/mcp`. Tools appear automatically. Then talk to the model in the web UI just like the Claude Code examples above.
 
 ---
 
-## tools
+## install
 
-| Tool | Description |
-|------|-------------|
-| `read_messages` | Return buffered messages. `room_id` filters, `limit` caps count (default 30). |
-| `send_message` | Send a message. Optional `room_id`. |
-| `reply_to` | Quote-reply to a message by its ID using `@<id>` syntax. |
-| `list_rooms` | List all rooms the server has sent us. |
-| `join_room` | Switch to a different room by numeric ID. |
-| `fetch_history` | Ask the server for older messages (limited for guests). |
-| `status` | Connection status, username, buffer stats. |
-| `logout` | Clear the saved token. Restart the server to log in again. |
+Requires **Node 18+**. You don't usually need a local install — `npx -y skychat-mcp@latest` works for both setups above. For the Claude Code setup you don't run anything manually at all: Claude Code spawns the server itself as a subprocess.
+
+If you specifically want a global install (mainly useful for running the long-lived HTTP/SSE servers for browser-based clients):
+
+```bash
+npm install -g skychat-mcp
+skychat-mcp --http --port=8765       # streamable HTTP
+skychat-mcp --sse --port=8765        # legacy SSE
+```
 
 ---
 
@@ -105,13 +76,32 @@ To remove the server: `claude mcp remove skychat`.
 
 Resolved on startup in this order:
 
-| Priority | Method | How |
-|----------|--------|-----|
+| Priority | Source | Notes |
+|---|---|---|
 | 1 | `--guest` flag | anonymous, no prompt |
-| 2 | Saved token | loaded from `~/.config/skychat-mcp/token.json` |
-| 3 | Interactive prompt | enter username/password on the terminal |
+| 2 | `SKYCHAT_TOKEN` env var | JSON or string token |
+| 3 | `~/.config/skychat-mcp/token.json` | saved after a successful login |
+| 4 | `SKYCHAT_USERNAME` + `SKYCHAT_PASSWORD` env vars | new login, token gets saved |
+| 5 | fallback | guest |
 
-Token storage is deliberately separate from skychat-tui (`~/.config/skychat/token.json`) so the two don't interfere. To log out: call the `logout` tool or delete the token file, then restart.
+There is no interactive prompt — env vars are the only way to log in. This keeps the server safe to spawn over stdio (the recommended Claude Code setup).
+
+To log out: call the `logout` tool, or delete the token file. The next start with no `SKYCHAT_*` env vars falls back to guest.
+
+---
+
+## tools
+
+| Tool | Description |
+|---|---|
+| `read_messages` | Return buffered messages. `room_id` filters, `limit` caps count (default 30, max 200). |
+| `send_message` | Send a message. Optional `room_id`. |
+| `reply_to` | Quote-reply to a message by its ID using `@<id>` syntax. |
+| `list_rooms` | List all rooms the server knows about. |
+| `join_room` | Switch to a different room by numeric ID. |
+| `fetch_history` | Ask the server for older messages (limited for guests). |
+| `status` | Connection status, username, buffer stats. |
+| `logout` | Clear the saved auth token. Restart the server to log in again. |
 
 ---
 
@@ -120,14 +110,14 @@ Token storage is deliberately separate from skychat-tui (`~/.config/skychat/toke
 Pass `--auto-reply` to have the server respond automatically whenever the bot account is @mentioned. The LLM receives the mention, calls tools (`reply_to`, `send_message`, `join_room`, `read_messages`) until it's satisfied, then stops.
 
 ```bash
-python skychat_mcp.py --http --auto-reply
-python skychat_mcp.py --http --auto-reply --llm-url=http://localhost:8080
-python skychat_mcp.py --http --auto-reply --system-prompt="You are a pirate."
-python skychat_mcp.py --http --auto-reply --system-prompt-file=prompt.txt
+npx -y skychat-mcp@latest --http --auto-reply
+npx -y skychat-mcp@latest --http --auto-reply --llm-url=http://localhost:8080
+npx -y skychat-mcp@latest --http --auto-reply --system-prompt="You are a pirate."
+npx -y skychat-mcp@latest --http --auto-reply --system-prompt-file=prompt.txt
 ```
 
 | Flag | Default | Description |
-|------|---------|-------------|
+|---|---|---|
 | `--auto-reply` | off | Enable the mention→LLM loop |
 | `--llm-url=URL` | `http://localhost:8080` | Base URL of an OpenAI-compatible API (`/v1/chat/completions`) |
 | `--system-prompt=TEXT` | brief helpful-assistant prompt | System prompt sent to the LLM |
@@ -140,17 +130,34 @@ The LLM must support OpenAI-style function/tool calling. `llama-server` works ou
 ## environment variables
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+|---|---|---|
 | `SKYCHAT_URL` | `wss://skych.at/api/ws` | WebSocket URL — override for self-hosted instances |
-| `XDG_CONFIG_HOME` | `~/.config` | Base directory for config/token storage |
+| `SKYCHAT_TOKEN` | — | Resume with a previously issued token (JSON or string) |
+| `SKYCHAT_USERNAME` | — | Username for fresh login |
+| `SKYCHAT_PASSWORD` | — | Password for fresh login |
+| `XDG_CONFIG_HOME` | `~/.config` | Base directory for token storage |
+
+---
+
+## development
+
+```bash
+git clone https://github.com/skychatorg/skychat-mcp.git
+cd skychat-mcp
+npm install
+npm run build
+npm start -- --guest --http
+```
+
+Other scripts: `npm run dev` (watch mode via tsx), `npm run lint`, `npm run lint-fix`.
 
 ---
 
 ## notes
 
 - Guests can read messages and join rooms, but history is very limited. Log in for full access.
-- Restart the server to switch accounts: call `logout`, then restart and enter new credentials.
 - Buffer holds the last **500 messages** across all rooms; oldest are dropped at the cap.
+- Default transport is **stdio**, which is what Claude Code expects and the most efficient. `--http` and `--sse` exist for browser-based clients like llama-server.
 
 ---
 
